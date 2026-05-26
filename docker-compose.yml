@@ -95,7 +95,7 @@ services:
     environment:
       WK_WEB_API_URL: ${WK_WEB_API_URL:-http://wk-node1:5301}
     ports:
-      - "18080:80"
+      - "18081:80"
 
   prometheus:
     image: prom/prometheus:v3
@@ -128,4 +128,4 @@ services:
       - ./docker/observability/grafana/dashboards:/etc/grafana/dashboards:ro
       - ./docker/dev-observability/grafana:/var/lib/grafana
     ports:
-      - "3000:3000"
+      - "3002:3000"

@@ -24,6 +24,27 @@
 - 显式指定配置文件：`go run ./cmd/wukongim -config ./wukongim.conf`
 - 定向测试：`go test ./internal/... ./pkg/...`
 
+## 本地部署记录
+
+- 当前工作目录 `D:\knowledgeBase\WuKongIM` 是仓库根目录，代码直接克隆到此目录，未额外创建 `WuKongIM` 子目录。
+- `origin` 指向用户 fork：`https://github.com/chouyong/WuKongIM.git`。
+- `upstream` 指向官方仓库：`https://github.com/WuKongIM/WuKongIM.git`。
+- 本机可用代理：SOCKS 代理 `127.0.0.1:1080`，HTTP 代理 `127.0.0.1:18080`。
+- Docker 构建时容器内不能使用 `127.0.0.1` 访问宿主机代理，应使用 `host.docker.internal`，例如：
+  - `HTTP_PROXY=http://host.docker.internal:18080`
+  - `HTTPS_PROXY=http://host.docker.internal:18080`
+  - `ALL_PROXY=socks5://host.docker.internal:1080`
+- 本地 Docker Compose 已成功构建并启动 `wk-node1`、`wk-node2`、`wk-node3`、`wk-web`、`prometheus`、`grafana`。
+- `wk-web` 的宿主机端口已从默认 `18080` 改为 `18081`，因为 `18080` 被本机 HTTP 代理占用。访问地址：`http://127.0.0.1:18081`。
+- `grafana` 的宿主机端口已从默认 `3000` 改为 `3002`，因为 `3000` 和 `3001` 都已被本机其他程序占用。访问地址：`http://127.0.0.1:3002`。
+- `prometheus` 访问地址：`http://127.0.0.1:9091`。
+- 管理后台登录地址：`http://127.0.0.1:18081/login`。
+- 管理后台默认账号：`admin`，默认密码：`a1234567`。来源为 `docker/conf/node1.conf` 中的 `WK_MANAGER_USERS`。
+- 若浏览器访问 `http://127.0.0.1:18080` 出现 `502 Bad Gateway / Host Not Found or connection failed`，优先判断为打到了本机代理端口，不是 `wk-web` 容器故障。
+- 查看服务状态：`docker compose ps`。
+- 重启 Web 服务：`docker compose up -d wk-web`。
+- 重启 Grafana：`docker compose up -d grafana`。
+
 ## 性能调试规则
 
 - 分析 `wk-sim`、`wkbench dev-sim` 或三节点 Docker Compose 性能/超时/吞吐问题时，先阅读并遵循 `.codex/skills/wukongim-perf-triage/SKILL.md`。
