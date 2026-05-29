@@ -10,15 +10,15 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/WuKongIM/WuKongIM/internal/gateway"
 	runtimechannelmeta "github.com/WuKongIM/WuKongIM/internal/runtime/channelmeta"
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
 	channelhandler "github.com/WuKongIM/WuKongIM/pkg/channel/handler"
 	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel/runtime"
-	channelstore "github.com/WuKongIM/WuKongIM/pkg/channel/store"
 	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
+	channelstore "github.com/WuKongIM/WuKongIM/pkg/db/message"
+	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
+	"github.com/WuKongIM/WuKongIM/pkg/gateway"
 	raftstorage "github.com/WuKongIM/WuKongIM/pkg/raftlog"
-	metadb "github.com/WuKongIM/WuKongIM/pkg/slot/meta"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/stretchr/testify/require"
 )

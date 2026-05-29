@@ -15,14 +15,15 @@ type Result struct {
 	// Duration is the worker execution time measured by the owning pool.
 	Duration time.Duration
 
-	StoreAppend        *StoreAppendResult
-	StoreReadCommitted *StoreReadCommittedResult
-	StoreReadLog       *StoreReadLogResult
-	StoreApply         *StoreApplyResult
-	RPCPull            *RPCPullResult
-	RPCAck             *RPCAckResult
-	RPCNotify          *RPCNotifyResult
-	Value              any
+	StoreAppend     *StoreAppendResult
+	StoreReadLog    *StoreReadLogResult
+	StoreApply      *StoreApplyResult
+	StoreCheckpoint *StoreCheckpointResult
+	RPCPull         *RPCPullResult
+	RPCAck          *RPCAckResult
+	RPCNotify       *RPCNotifyResult
+	RPCPullHint     *RPCPullHintResult
+	Value           any
 }
 
 // StoreAppendResult returns the durable offset range for a leader append.
@@ -31,14 +32,6 @@ type StoreAppendResult struct {
 	BaseOffset uint64
 	// LastOffset is the last offset assigned to the appended records.
 	LastOffset uint64
-}
-
-// StoreReadCommittedResult contains committed messages read from storage.
-type StoreReadCommittedResult struct {
-	// Messages are the committed messages returned by storage.
-	Messages []ch.Message
-	// NextSeq is the next sequence callers should read from.
-	NextSeq uint64
 }
 
 // StoreReadLogResult contains raw log records read for replication.
@@ -53,6 +46,9 @@ type StoreApplyResult struct {
 	LEO uint64
 }
 
+// StoreCheckpointResult marks a completed checkpoint persistence task.
+type StoreCheckpointResult struct{}
+
 // RPCPullResult contains the response returned by a remote pull RPC.
 type RPCPullResult struct {
 	// Response is the leader pull response returned by transport.
@@ -62,8 +58,11 @@ type RPCPullResult struct {
 // RPCAckResult marks a completed remote acknowledgement RPC.
 type RPCAckResult struct{}
 
-// RPCNotifyResult marks a completed remote replication notification RPC.
+// RPCNotifyResult marks a completed legacy compatibility nudge RPC.
 type RPCNotifyResult struct{}
+
+// RPCPullHintResult marks a completed remote pull hint RPC.
+type RPCPullHintResult struct{}
 
 // CompletionSink receives worker completions for routing back to reactors.
 type CompletionSink interface {

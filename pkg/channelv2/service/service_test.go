@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSingleNodeAppendFetchCommitted(t *testing.T) {
+func TestSingleNodeAppendStoresMessage(t *testing.T) {
 	factory := store.NewMemoryFactory()
 	cluster, err := New(Config{LocalNode: 1, Store: factory, ReactorCount: 1})
 	require.NoError(t, err)
@@ -27,27 +27,38 @@ func TestSingleNodeAppendFetchCommitted(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), appendRes.MessageSeq)
 
-	fetchRes, err := cluster.Fetch(context.Background(), ch.FetchRequest{ChannelID: meta.ID, FromSeq: 1, Limit: 10, MaxBytes: 1024})
-	require.NoError(t, err)
-	require.Len(t, fetchRes.Messages, 1)
-	require.Equal(t, uint64(1), fetchRes.CommittedSeq)
+	messages := readServiceStoreMessages(t, factory, meta, 1)
+	require.Len(t, messages, 1)
+	require.Equal(t, uint64(1), messages[0].MessageSeq)
 }
 
-func TestAppendLazyLoadsMetaBeforeSubmittingToReactor(t *testing.T) {
+func TestAppendRequiresLoadedChannelState(t *testing.T) {
 	factory := store.NewMemoryFactory()
-	meta := ch.Meta{Key: ch.ChannelKey("1:lazy"), ID: ch.ChannelID{ID: "lazy", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1, Replicas: []ch.NodeID{1}, ISR: []ch.NodeID{1}, MinISR: 1, Status: ch.StatusActive}
+	meta := ch.Meta{Key: ch.ChannelKey("1:not-loaded"), ID: ch.ChannelID{ID: "not-loaded", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1, Replicas: []ch.NodeID{1}, ISR: []ch.NodeID{1}, MinISR: 1, Status: ch.StatusActive}
 	resolver := &countingMetaResolver{meta: meta}
 	cluster, err := New(Config{LocalNode: 1, Store: factory, ReactorCount: 1, MetaResolver: resolver})
 	require.NoError(t, err)
 	defer cluster.Close()
 
-	appendRes, err := cluster.Append(context.Background(), ch.AppendRequest{ChannelID: meta.ID, Message: ch.Message{Payload: []byte("hello")}})
-	require.NoError(t, err)
-	require.Equal(t, uint64(1), appendRes.MessageSeq)
-	require.Equal(t, int32(1), resolver.calls.Load())
+	_, err = cluster.Append(context.Background(), ch.AppendRequest{ChannelID: meta.ID, Message: ch.Message{Payload: []byte("hello")}})
+	require.ErrorIs(t, err, ch.ErrChannelNotFound)
+	require.Equal(t, int32(0), resolver.calls.Load())
 }
 
-func TestAppendUsesExistingReactorStateWithoutResolvingMetaAgain(t *testing.T) {
+func TestAppendBatchRequiresLoadedChannelState(t *testing.T) {
+	factory := store.NewMemoryFactory()
+	meta := ch.Meta{Key: ch.ChannelKey("1:batch-not-loaded"), ID: ch.ChannelID{ID: "batch-not-loaded", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1, Replicas: []ch.NodeID{1}, ISR: []ch.NodeID{1}, MinISR: 1, Status: ch.StatusActive}
+	resolver := &countingMetaResolver{meta: meta}
+	cluster, err := New(Config{LocalNode: 1, Store: factory, ReactorCount: 1, MetaResolver: resolver})
+	require.NoError(t, err)
+	defer cluster.Close()
+
+	_, err = cluster.AppendBatch(context.Background(), ch.AppendBatchRequest{ChannelID: meta.ID, Messages: []ch.Message{{Payload: []byte("hello")}}})
+	require.ErrorIs(t, err, ch.ErrChannelNotFound)
+	require.Equal(t, int32(0), resolver.calls.Load())
+}
+
+func TestAppendUsesExistingReactorStateWithoutResolvingMeta(t *testing.T) {
 	factory := store.NewMemoryFactory()
 	meta := ch.Meta{Key: ch.ChannelKey("1:cached"), ID: ch.ChannelID{ID: "cached", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1, Replicas: []ch.NodeID{1}, ISR: []ch.NodeID{1}, MinISR: 1, Status: ch.StatusActive}
 	resolver := &countingMetaResolver{meta: meta}
@@ -55,16 +66,209 @@ func TestAppendUsesExistingReactorStateWithoutResolvingMetaAgain(t *testing.T) {
 	require.NoError(t, err)
 	defer cluster.Close()
 
+	require.NoError(t, cluster.ApplyMeta(meta))
 	_, err = cluster.Append(context.Background(), ch.AppendRequest{ChannelID: meta.ID, Message: ch.Message{Payload: []byte("first")}})
 	require.NoError(t, err)
 	_, err = cluster.Append(context.Background(), ch.AppendRequest{ChannelID: meta.ID, Message: ch.Message{Payload: []byte("second")}})
 	require.NoError(t, err)
+	require.Equal(t, int32(0), resolver.calls.Load())
+}
+
+func TestAppendRejectsStaleExpectedEpochs(t *testing.T) {
+	clusterAPI, err := New(Config{LocalNode: 1, Store: store.NewMemoryFactory(), ReactorCount: 1})
+	require.NoError(t, err)
+	defer clusterAPI.Close()
+
+	meta := ch.Meta{
+		Key:         ch.ChannelKey("1:expected-append"),
+		ID:          ch.ChannelID{ID: "expected-append", Type: 1},
+		Epoch:       2,
+		LeaderEpoch: 3,
+		Leader:      1,
+		Replicas:    []ch.NodeID{1},
+		ISR:         []ch.NodeID{1},
+		MinISR:      1,
+		Status:      ch.StatusActive,
+	}
+	require.NoError(t, clusterAPI.ApplyMeta(meta))
+
+	_, err = clusterAPI.Append(context.Background(), ch.AppendRequest{
+		ChannelID:            meta.ID,
+		Message:              ch.Message{Payload: []byte("stale-channel")},
+		ExpectedChannelEpoch: 1,
+		ExpectedLeaderEpoch:  meta.LeaderEpoch,
+	})
+	require.ErrorIs(t, err, ch.ErrStaleMeta)
+
+	_, err = clusterAPI.Append(context.Background(), ch.AppendRequest{
+		ChannelID:            meta.ID,
+		Message:              ch.Message{Payload: []byte("stale-leader")},
+		ExpectedChannelEpoch: meta.Epoch,
+		ExpectedLeaderEpoch:  2,
+	})
+	require.ErrorIs(t, err, ch.ErrStaleMeta)
+
+	res, err := clusterAPI.Append(context.Background(), ch.AppendRequest{
+		ChannelID:            meta.ID,
+		Message:              ch.Message{Payload: []byte("current")},
+		ExpectedChannelEpoch: meta.Epoch,
+		ExpectedLeaderEpoch:  meta.LeaderEpoch,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), res.MessageSeq)
+}
+
+func TestHandlePullHintLazyLoadsFollowerMeta(t *testing.T) {
+	factory := store.NewMemoryFactory()
+	meta := ch.Meta{Key: ch.ChannelKey("1:hint-lazy"), ID: ch.ChannelID{ID: "hint-lazy", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1, Replicas: []ch.NodeID{1, 2}, ISR: []ch.NodeID{1, 2}, MinISR: 1, Status: ch.StatusActive}
+	resolver := &countingMetaResolver{meta: meta}
+	clusterAPI, err := New(Config{LocalNode: 2, Store: factory, ReactorCount: 1, MetaResolver: resolver})
+	require.NoError(t, err)
+	defer clusterAPI.Close()
+	svc := clusterAPI.(*cluster)
+
+	err = svc.HandlePullHint(context.Background(), transport.PullHintRequest{ChannelKey: meta.Key, ChannelID: meta.ID, Epoch: 1, LeaderEpoch: 1, Leader: 1, LeaderLEO: 1, ActivityVersion: 1, Reason: transport.PullHintReasonAppend})
+	require.NoError(t, err)
 	require.Equal(t, int32(1), resolver.calls.Load())
+
+	loaded, err := svc.group.HasChannelState(context.Background(), meta.Key)
+	require.NoError(t, err)
+	require.True(t, loaded)
+}
+
+func TestHandlePullHintResolverFailureDoesNotLoadState(t *testing.T) {
+	factory := store.NewMemoryFactory()
+	id := ch.ChannelID{ID: "hint-missing", Type: 1}
+	key := ch.ChannelKeyForID(id)
+	resolver := &failingMetaResolver{err: ch.ErrChannelNotFound}
+	clusterAPI, err := New(Config{LocalNode: 2, Store: factory, ReactorCount: 1, MetaResolver: resolver})
+	require.NoError(t, err)
+	defer clusterAPI.Close()
+	svc := clusterAPI.(*cluster)
+
+	err = svc.HandlePullHint(context.Background(), transport.PullHintRequest{ChannelKey: key, ChannelID: id, Epoch: 1, LeaderEpoch: 1, Leader: 1, LeaderLEO: 1, ActivityVersion: 1, Reason: transport.PullHintReasonAppend})
+	require.ErrorIs(t, err, ch.ErrChannelNotFound)
+	require.Equal(t, int32(1), resolver.calls.Load())
+
+	loaded, err := svc.group.HasChannelState(context.Background(), key)
+	require.NoError(t, err)
+	require.False(t, loaded)
+}
+
+func TestHandlePullHintRejectsResolvedMetaWithDifferentID(t *testing.T) {
+	factory := store.NewMemoryFactory()
+	reqID := ch.ChannelID{ID: "hint-stale-id", Type: 1}
+	meta := ch.Meta{Key: ch.ChannelKeyForID(reqID), ID: ch.ChannelID{ID: "different-id", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1, Replicas: []ch.NodeID{1, 2}, ISR: []ch.NodeID{1, 2}, MinISR: 1, Status: ch.StatusActive}
+	resolver := &staticMetaResolver{meta: meta}
+	clusterAPI, err := New(Config{LocalNode: 2, Store: factory, ReactorCount: 1, MetaResolver: resolver})
+	require.NoError(t, err)
+	defer clusterAPI.Close()
+	svc := clusterAPI.(*cluster)
+
+	err = svc.HandlePullHint(context.Background(), transport.PullHintRequest{ChannelKey: meta.Key, ChannelID: reqID, Epoch: 1, LeaderEpoch: 1, Leader: 1, LeaderLEO: 1, ActivityVersion: 1, Reason: transport.PullHintReasonAppend})
+	require.ErrorIs(t, err, ch.ErrStaleMeta)
+
+	loaded, err := svc.group.HasChannelState(context.Background(), meta.Key)
+	require.NoError(t, err)
+	require.False(t, loaded)
+}
+
+func TestHandlePullHintRejectsLocalLeaderLazyActivation(t *testing.T) {
+	factory := store.NewMemoryFactory()
+	meta := ch.Meta{Key: ch.ChannelKey("1:hint-leader"), ID: ch.ChannelID{ID: "hint-leader", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1, Replicas: []ch.NodeID{1, 2}, ISR: []ch.NodeID{1, 2}, MinISR: 1, Status: ch.StatusActive}
+	resolver := &countingMetaResolver{meta: meta}
+	clusterAPI, err := New(Config{LocalNode: 1, Store: factory, ReactorCount: 1, MetaResolver: resolver})
+	require.NoError(t, err)
+	defer clusterAPI.Close()
+	svc := clusterAPI.(*cluster)
+
+	err = svc.HandlePullHint(context.Background(), transport.PullHintRequest{ChannelKey: meta.Key, ChannelID: meta.ID, Epoch: 1, LeaderEpoch: 1, Leader: 1, LeaderLEO: 1, ActivityVersion: 1, Reason: transport.PullHintReasonAppend})
+	require.ErrorIs(t, err, ch.ErrStaleMeta)
+
+	loaded, err := svc.group.HasChannelState(context.Background(), meta.Key)
+	require.NoError(t, err)
+	require.False(t, loaded)
+}
+
+func TestHandleNotifyKeepsLegacyNoOpForInvalidHints(t *testing.T) {
+	tests := []struct {
+		name      string
+		localNode ch.NodeID
+		resolver  ch.MetaResolver
+		req       transport.NotifyRequest
+		loadedKey ch.ChannelKey
+	}{
+		{
+			name:      "unloaded without resolver",
+			localNode: 2,
+			req:       transport.NotifyRequest{ChannelKey: ch.ChannelKey("1:legacy-pull-hint-missing"), ChannelID: ch.ChannelID{ID: "legacy-pull-hint-missing", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1},
+			loadedKey: ch.ChannelKey("1:legacy-pull-hint-missing"),
+		},
+		{
+			name:      "stale resolved metadata",
+			localNode: 2,
+			resolver:  &staticMetaResolver{meta: ch.Meta{Key: ch.ChannelKey("1:legacy-pull-hint-stale"), ID: ch.ChannelID{ID: "different", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1, Replicas: []ch.NodeID{1, 2}, ISR: []ch.NodeID{1, 2}, MinISR: 1, Status: ch.StatusActive}},
+			req:       transport.NotifyRequest{ChannelKey: ch.ChannelKey("1:legacy-pull-hint-stale"), ChannelID: ch.ChannelID{ID: "legacy-pull-hint-stale", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1},
+			loadedKey: ch.ChannelKey("1:legacy-pull-hint-stale"),
+		},
+		{
+			name:      "local leader validation",
+			localNode: 1,
+			resolver:  &countingMetaResolver{meta: ch.Meta{Key: ch.ChannelKey("1:legacy-pull-hint-local-leader"), ID: ch.ChannelID{ID: "legacy-pull-hint-local-leader", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1, Replicas: []ch.NodeID{1, 2}, ISR: []ch.NodeID{1, 2}, MinISR: 1, Status: ch.StatusActive}},
+			req:       transport.NotifyRequest{ChannelKey: ch.ChannelKey("1:legacy-pull-hint-local-leader"), ChannelID: ch.ChannelID{ID: "legacy-pull-hint-local-leader", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1},
+			loadedKey: ch.ChannelKey("1:legacy-pull-hint-local-leader"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			factory := store.NewMemoryFactory()
+			clusterAPI, err := New(Config{LocalNode: tt.localNode, Store: factory, ReactorCount: 1, MetaResolver: tt.resolver})
+			require.NoError(t, err)
+			defer clusterAPI.Close()
+			svc := clusterAPI.(*cluster)
+
+			require.NoError(t, svc.HandleNotify(context.Background(), tt.req))
+
+			loaded, err := svc.group.HasChannelState(context.Background(), tt.loadedKey)
+			require.NoError(t, err)
+			require.False(t, loaded)
+		})
+	}
+}
+
+func TestHandleNotifyUsesLeaderLEOAsPullHintActivityVersion(t *testing.T) {
+	factory := store.NewMemoryFactory()
+	net := newServiceCaptureTransport()
+	meta := ch.Meta{
+		Key: ch.ChannelKey("1:legacy-notify-activity"), ID: ch.ChannelID{ID: "legacy-notify-activity", Type: 1},
+		Epoch: 1, LeaderEpoch: 1, Leader: 1, Replicas: []ch.NodeID{1, 2}, ISR: []ch.NodeID{1, 2}, MinISR: 1, Status: ch.StatusActive,
+	}
+	net.SetPullResponse(transport.PullResponse{
+		ChannelKey: meta.Key, Epoch: meta.Epoch, LeaderEpoch: meta.LeaderEpoch,
+		LeaderHW: 0, LeaderLEO: 0, ActivityVersion: 5, NextPullAfter: time.Hour, Control: transport.PullControlContinue,
+	})
+	clusterAPI, err := New(Config{LocalNode: 2, Store: factory, Transport: net, ReactorCount: 1, ReplicationIdlePollInterval: time.Hour})
+	require.NoError(t, err)
+	defer clusterAPI.Close()
+	svc := clusterAPI.(*cluster)
+	require.NoError(t, svc.ApplyMeta(meta))
+	require.Eventually(t, func() bool { return net.PullCalls() == 1 }, time.Second, time.Millisecond)
+	require.True(t, awaitServiceTick(t, svc, meta.Key, time.Now()))
+
+	net.SetPullResponse(transport.PullResponse{
+		ChannelKey: meta.Key, Epoch: meta.Epoch, LeaderEpoch: meta.LeaderEpoch,
+		LeaderHW: 0, LeaderLEO: 0, ActivityVersion: 6, NextPullAfter: time.Hour, Control: transport.PullControlContinue,
+	})
+	require.NoError(t, svc.HandleNotify(context.Background(), transport.NotifyRequest{
+		ChannelKey: meta.Key, ChannelID: meta.ID, Epoch: meta.Epoch, LeaderEpoch: meta.LeaderEpoch, Leader: meta.Leader, LeaderLEO: 6,
+	}))
+
+	require.Eventually(t, func() bool { return net.PullCalls() >= 2 }, time.Second, time.Millisecond)
 }
 
 func TestHandlePullUsesAllocatedOpIDAndReturnsRecords(t *testing.T) {
 	factory := newServiceBlockingReadLogFactory()
-	clusterAPI, err := New(Config{LocalNode: 1, Store: factory, ReactorCount: 1})
+	clusterAPI, err := New(Config{LocalNode: 1, Store: factory, ReactorCount: 1, LeaderRecentRecordCacheSize: -1})
 	require.NoError(t, err)
 	defer clusterAPI.Close()
 	svc := clusterAPI.(*cluster)
@@ -100,6 +304,66 @@ func TestHandlePullUsesAllocatedOpIDAndReturnsRecords(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for pull response")
 	}
+}
+
+func TestHandleAckAdvancesHWAndCompletesQuorumAppend(t *testing.T) {
+	factory := store.NewMemoryFactory()
+	clusterAPI, err := New(Config{LocalNode: 1, Store: factory, ReactorCount: 1})
+	require.NoError(t, err)
+	defer clusterAPI.Close()
+	svc := clusterAPI.(*cluster)
+
+	meta := ch.Meta{
+		Key:         ch.ChannelKey("1:ack-quorum"),
+		ID:          ch.ChannelID{ID: "ack-quorum", Type: 1},
+		Epoch:       1,
+		LeaderEpoch: 1,
+		Leader:      1,
+		Replicas:    []ch.NodeID{1, 2},
+		ISR:         []ch.NodeID{1, 2},
+		MinISR:      2,
+		Status:      ch.StatusActive,
+	}
+	require.NoError(t, svc.ApplyMeta(meta))
+
+	appendDone := make(chan serviceAppendOutcome, 1)
+	go func() {
+		res, err := svc.Append(context.Background(), ch.AppendRequest{
+			ChannelID: meta.ID,
+			Message:   ch.Message{MessageID: 10, Payload: []byte("hello")},
+		})
+		appendDone <- serviceAppendOutcome{result: res, err: err}
+	}()
+
+	require.Eventually(t, func() bool {
+		select {
+		case outcome := <-appendDone:
+			t.Fatalf("append completed before follower ack: result=%+v err=%v", outcome.result, outcome.err)
+			return false
+		default:
+		}
+		return awaitServiceTick(t, svc, meta.Key, time.Now())
+	}, time.Second, time.Millisecond)
+
+	require.NoError(t, svc.HandleAck(context.Background(), transport.AckRequest{
+		ChannelKey:  meta.Key,
+		Epoch:       meta.Epoch,
+		LeaderEpoch: meta.LeaderEpoch,
+		Follower:    2,
+		MatchOffset: 1,
+	}))
+
+	select {
+	case outcome := <-appendDone:
+		require.NoError(t, outcome.err)
+		require.Equal(t, uint64(1), outcome.result.MessageSeq)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for quorum append")
+	}
+
+	messages := readServiceStoreMessages(t, factory, meta, 1)
+	require.Len(t, messages, 1)
+	require.Equal(t, uint64(1), messages[0].MessageSeq)
 }
 
 func TestAppendBatchContextCancelAfterAdmissionCleansQueuedWaiter(t *testing.T) {
@@ -229,6 +493,20 @@ func TestAppendBatchContextCancelReturnsContextErrorWhenCleanupBackpressured(t *
 	require.NoError(t, err)
 }
 
+type serviceAppendOutcome struct {
+	result ch.AppendResult
+	err    error
+}
+
+func readServiceStoreMessages(t testing.TB, factory *store.MemoryFactory, meta ch.Meta, maxSeq uint64) []ch.Message {
+	t.Helper()
+	cs, err := factory.ChannelStore(meta.Key, meta.ID)
+	require.NoError(t, err)
+	read, err := cs.ReadCommitted(context.Background(), store.ReadCommittedRequest{FromSeq: 1, MaxSeq: maxSeq, Limit: 10, MaxBytes: 1024})
+	require.NoError(t, err)
+	return read.Messages
+}
+
 type countingMetaResolver struct {
 	meta  ch.Meta
 	calls atomic.Int32
@@ -243,6 +521,77 @@ func (r *countingMetaResolver) ResolveChannelMeta(ctx context.Context, id ch.Cha
 	}
 	r.calls.Add(1)
 	return r.meta, nil
+}
+
+type staticMetaResolver struct {
+	meta  ch.Meta
+	calls atomic.Int32
+}
+
+func (r *staticMetaResolver) ResolveChannelMeta(ctx context.Context, id ch.ChannelID) (ch.Meta, error) {
+	if err := ctx.Err(); err != nil {
+		return ch.Meta{}, err
+	}
+	r.calls.Add(1)
+	return r.meta, nil
+}
+
+type failingMetaResolver struct {
+	err   error
+	calls atomic.Int32
+}
+
+func (r *failingMetaResolver) ResolveChannelMeta(ctx context.Context, id ch.ChannelID) (ch.Meta, error) {
+	if err := ctx.Err(); err != nil {
+		return ch.Meta{}, err
+	}
+	r.calls.Add(1)
+	return ch.Meta{}, r.err
+}
+
+type serviceCaptureTransport struct {
+	mu       sync.Mutex
+	pulls    int
+	pullResp transport.PullResponse
+}
+
+func newServiceCaptureTransport() *serviceCaptureTransport {
+	return &serviceCaptureTransport{}
+}
+
+func (t *serviceCaptureTransport) Pull(ctx context.Context, node ch.NodeID, req transport.PullRequest) (transport.PullResponse, error) {
+	t.mu.Lock()
+	t.pulls++
+	resp := t.pullResp
+	t.mu.Unlock()
+	if resp.ChannelKey == "" {
+		resp = transport.PullResponse{ChannelKey: req.ChannelKey, Epoch: req.Epoch, LeaderEpoch: req.LeaderEpoch, LeaderHW: req.NextOffset - 1, LeaderLEO: req.NextOffset - 1}
+	}
+	return resp, nil
+}
+
+func (t *serviceCaptureTransport) Ack(ctx context.Context, node ch.NodeID, req transport.AckRequest) error {
+	return nil
+}
+
+func (t *serviceCaptureTransport) PullHint(ctx context.Context, node ch.NodeID, req transport.PullHintRequest) error {
+	return nil
+}
+
+func (t *serviceCaptureTransport) Notify(ctx context.Context, node ch.NodeID, req transport.NotifyRequest) error {
+	return nil
+}
+
+func (t *serviceCaptureTransport) SetPullResponse(resp transport.PullResponse) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.pullResp = resp
+}
+
+func (t *serviceCaptureTransport) PullCalls() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.pulls
 }
 
 func awaitServiceTick(t *testing.T, cluster *cluster, key ch.ChannelKey, now time.Time) bool {

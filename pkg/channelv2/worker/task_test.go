@@ -39,6 +39,31 @@ func (s *workerTransportServer) HandleNotify(ctx context.Context, req transport.
 	return nil
 }
 
+func (s *workerTransportServer) HandlePullHint(ctx context.Context, req transport.PullHintRequest) error {
+	return nil
+}
+
+type workerCaptureServer struct {
+	pullHint transport.PullHintRequest
+}
+
+func (s *workerCaptureServer) HandlePull(ctx context.Context, req transport.PullRequest) (transport.PullResponse, error) {
+	return transport.PullResponse{}, nil
+}
+
+func (s *workerCaptureServer) HandleAck(ctx context.Context, req transport.AckRequest) error {
+	return nil
+}
+
+func (s *workerCaptureServer) HandleNotify(ctx context.Context, req transport.NotifyRequest) error {
+	return nil
+}
+
+func (s *workerCaptureServer) HandlePullHint(ctx context.Context, req transport.PullHintRequest) error {
+	s.pullHint = req
+	return nil
+}
+
 func TestTaskRunStoreAppendUsesStoreDeps(t *testing.T) {
 	key := ch.ChannelKey("1:a")
 	id := ch.ChannelID{ID: "a", Type: 1}
@@ -62,36 +87,6 @@ func TestTaskRunStoreAppendUsesStoreDeps(t *testing.T) {
 	require.NotNil(t, res.StoreAppend)
 	require.Equal(t, uint64(1), res.StoreAppend.BaseOffset)
 	require.Equal(t, uint64(1), res.StoreAppend.LastOffset)
-}
-
-func TestTaskRunStoreReadCommittedUsesStoreDeps(t *testing.T) {
-	key := ch.ChannelKey("1:a")
-	id := ch.ChannelID{ID: "a", Type: 1}
-	factory := store.NewMemoryFactory()
-	cs, err := factory.ChannelStore(key, id)
-	require.NoError(t, err)
-	_, err = cs.AppendLeader(context.Background(), store.AppendLeaderRequest{Records: []ch.Record{{ID: 1, Payload: []byte("a"), SizeBytes: 1}}})
-	require.NoError(t, err)
-	require.NoError(t, cs.StoreCheckpoint(context.Background(), ch.Checkpoint{HW: 1}))
-	fence := ch.Fence{ChannelKey: key, Generation: 1, Epoch: 1, LeaderEpoch: 1, OpID: 12}
-
-	res := Task{
-		Kind:  TaskStoreReadCommitted,
-		Fence: fence,
-		StoreReadCommitted: &StoreReadCommittedTask{
-			ChannelID: id,
-			FromSeq:   1,
-			MaxSeq:    1,
-			Limit:     10,
-			MaxBytes:  1024,
-		},
-	}.Run(context.Background(), Deps{Stores: factory})
-
-	require.NoError(t, res.Err)
-	require.Equal(t, TaskStoreReadCommitted, res.Kind)
-	require.NotNil(t, res.StoreReadCommitted)
-	require.Len(t, res.StoreReadCommitted.Messages, 1)
-	require.Equal(t, uint64(2), res.StoreReadCommitted.NextSeq)
 }
 
 func TestTaskRunStoreReadLogUsesStoreDeps(t *testing.T) {
@@ -144,6 +139,30 @@ func TestTaskRunStoreApplyUsesStoreDeps(t *testing.T) {
 	require.Equal(t, uint64(1), res.StoreApply.LEO)
 }
 
+func TestTaskRunStoreCheckpoint(t *testing.T) {
+	factory := store.NewMemoryFactory()
+	id := ch.ChannelID{ID: "checkpoint", Type: 1}
+	key := ch.ChannelKeyForID(id)
+	cs, err := factory.ChannelStore(key, id)
+	require.NoError(t, err)
+	_, err = cs.AppendLeader(context.Background(), store.AppendLeaderRequest{Records: []ch.Record{
+		{ID: 1, Payload: []byte("a"), SizeBytes: 1},
+		{ID: 2, Payload: []byte("b"), SizeBytes: 1},
+		{ID: 3, Payload: []byte("c"), SizeBytes: 1},
+		{ID: 4, Payload: []byte("d"), SizeBytes: 1},
+	}})
+	require.NoError(t, err)
+	task := Task{Kind: TaskStoreCheckpoint, Fence: ch.Fence{ChannelKey: key, OpID: 1}, StoreCheckpoint: &StoreCheckpointTask{ChannelID: id, Checkpoint: ch.Checkpoint{HW: 4}}}
+
+	res := task.Run(context.Background(), Deps{Stores: factory})
+	require.NoError(t, res.Err)
+	cs, err = factory.ChannelStore(key, id)
+	require.NoError(t, err)
+	loaded, err := cs.Load(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), loaded.CheckpointHW)
+}
+
 func TestTaskRunRPCPullAndAckUseTransportDeps(t *testing.T) {
 	net := transport.NewLocalNetwork()
 	server := &workerTransportServer{}
@@ -167,8 +186,22 @@ func TestTaskRunRPCPullAndAckUseTransportDeps(t *testing.T) {
 	require.Equal(t, uint64(10), server.lastNotify.LeaderLEO)
 }
 
+func TestTaskRunRPCPullHint(t *testing.T) {
+	net := transport.NewLocalNetwork()
+	srv := &workerCaptureServer{}
+	net.Register(2, srv)
+
+	req := transport.PullHintRequest{ChannelKey: ch.ChannelKey("1:a"), ChannelID: ch.ChannelID{ID: "a", Type: 1}, Epoch: 1, LeaderEpoch: 1, Leader: 1, LeaderLEO: 3, ActivityVersion: 3, Reason: transport.PullHintReasonAppend}
+	task := Task{Kind: TaskRPCPullHint, Fence: ch.Fence{ChannelKey: req.ChannelKey, OpID: 1}, RPCPullHint: &RPCPullHintTask{Node: 2, Request: req}}
+
+	res := task.Run(context.Background(), Deps{Transport: net})
+	require.NoError(t, res.Err)
+	require.NotNil(t, res.RPCPullHint)
+	require.Equal(t, req, srv.pullHint)
+}
+
 func TestTaskRunMissingDepsReturnsInvalidConfig(t *testing.T) {
-	res := Task{Kind: TaskStoreReadCommitted}.Run(context.Background(), Deps{})
+	res := Task{Kind: TaskStoreReadLog}.Run(context.Background(), Deps{})
 	require.ErrorIs(t, res.Err, ch.ErrInvalidConfig)
 }
 
@@ -214,12 +247,13 @@ func TestTaskRunNilTypedPayloadReturnsInvalidConfig(t *testing.T) {
 		task Task
 	}{
 		{name: "store append", task: Task{Kind: TaskStoreAppend, Fence: fence}},
-		{name: "store read committed", task: Task{Kind: TaskStoreReadCommitted, Fence: fence}},
 		{name: "store read log", task: Task{Kind: TaskStoreReadLog, Fence: fence}},
 		{name: "store apply", task: Task{Kind: TaskStoreApply, Fence: fence}},
+		{name: "store checkpoint", task: Task{Kind: TaskStoreCheckpoint, Fence: fence}},
 		{name: "rpc pull", task: Task{Kind: TaskRPCPull, Fence: fence}},
 		{name: "rpc ack", task: Task{Kind: TaskRPCAck, Fence: fence}},
 		{name: "rpc notify", task: Task{Kind: TaskRPCNotify, Fence: fence}},
+		{name: "rpc pull hint", task: Task{Kind: TaskRPCPullHint, Fence: fence}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

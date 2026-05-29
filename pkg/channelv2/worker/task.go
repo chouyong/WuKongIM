@@ -15,11 +15,12 @@ const (
 	TaskFunc TaskKind = iota + 1
 	TaskStoreAppend
 	TaskStoreApply
-	TaskStoreReadCommitted
 	TaskStoreReadLog
 	TaskRPCPull
 	TaskRPCAck
 	TaskRPCNotify
+	TaskStoreCheckpoint
+	TaskRPCPullHint
 )
 
 // Task describes blocking work submitted to a bounded pool.
@@ -29,13 +30,17 @@ type Task struct {
 	// Context cancels this task when the original caller gives up, in addition to pool shutdown.
 	Context context.Context
 
-	StoreAppend        *StoreAppendTask
-	StoreReadCommitted *StoreReadCommittedTask
-	StoreReadLog       *StoreReadLogTask
-	StoreApply         *StoreApplyTask
-	RPCPull            *RPCPullTask
-	RPCAck             *RPCAckTask
-	RPCNotify          *RPCNotifyTask
+	StoreAppend  *StoreAppendTask
+	StoreReadLog *StoreReadLogTask
+	StoreApply   *StoreApplyTask
+	// StoreCheckpoint persists a checkpoint before runtime eviction.
+	StoreCheckpoint *StoreCheckpointTask
+	RPCPull         *RPCPullTask
+	RPCAck          *RPCAckTask
+	// RPCNotify sends legacy transport compatibility nudges.
+	RPCNotify *RPCNotifyTask
+	// RPCPullHint sends a prompt pull nudge to a follower.
+	RPCPullHint *RPCPullHintTask
 
 	RunFunc func(context.Context) Result
 }
@@ -45,15 +50,6 @@ type StoreAppendTask struct {
 	ChannelID ch.ChannelID
 	Records   []ch.Record
 	Sync      bool
-}
-
-// StoreReadCommittedTask asks a worker to read committed messages.
-type StoreReadCommittedTask struct {
-	ChannelID ch.ChannelID
-	FromSeq   uint64
-	MaxSeq    uint64
-	Limit     int
-	MaxBytes  int
 }
 
 // StoreReadLogTask asks a worker to read raw records for replication.
@@ -71,6 +67,14 @@ type StoreApplyTask struct {
 	LeaderHW  uint64
 }
 
+// StoreCheckpointTask asks a worker to persist a channel checkpoint before eviction.
+type StoreCheckpointTask struct {
+	// ChannelID identifies the store that owns the checkpoint.
+	ChannelID ch.ChannelID
+	// Checkpoint is the durable committed frontier to persist.
+	Checkpoint ch.Checkpoint
+}
+
 // RPCPullTask asks a remote leader for records.
 type RPCPullTask struct {
 	Node    ch.NodeID
@@ -83,10 +87,18 @@ type RPCAckTask struct {
 	Request transport.AckRequest
 }
 
-// RPCNotifyTask nudges a remote follower to pull leader progress.
+// RPCNotifyTask is the legacy compatibility payload for follower nudges.
 type RPCNotifyTask struct {
 	Node    ch.NodeID
 	Request transport.NotifyRequest
+}
+
+// RPCPullHintTask asks a remote follower to pull leader progress promptly.
+type RPCPullHintTask struct {
+	// Node is the target follower node.
+	Node ch.NodeID
+	// Request is the pull hint payload sent to the follower.
+	Request transport.PullHintRequest
 }
 
 // Run executes the task payload with the provided blocking dependencies.
@@ -107,18 +119,20 @@ func (t Task) Run(ctx context.Context, deps Deps) Result {
 		}
 	case TaskStoreAppend:
 		res = runStoreAppend(ctx, deps, t)
-	case TaskStoreReadCommitted:
-		res = runStoreReadCommitted(ctx, deps, t)
 	case TaskStoreReadLog:
 		res = runStoreReadLog(ctx, deps, t)
 	case TaskStoreApply:
 		res = runStoreApply(ctx, deps, t)
+	case TaskStoreCheckpoint:
+		res = runStoreCheckpoint(ctx, deps, t)
 	case TaskRPCPull:
 		res = runRPCPull(ctx, deps, t)
 	case TaskRPCAck:
 		res = runRPCAck(ctx, deps, t)
 	case TaskRPCNotify:
 		res = runRPCNotify(ctx, deps, t)
+	case TaskRPCPullHint:
+		res = runRPCPullHint(ctx, deps, t)
 	default:
 		res = invalidResult(t)
 	}
@@ -186,22 +200,6 @@ func runStoreAppend(ctx context.Context, deps Deps, t Task) Result {
 	return Result{Kind: t.Kind, Fence: t.Fence, Err: err, StoreAppend: &StoreAppendResult{BaseOffset: stored.BaseOffset, LastOffset: stored.LastOffset}}
 }
 
-func runStoreReadCommitted(ctx context.Context, deps Deps, t Task) Result {
-	payload := t.StoreReadCommitted
-	if payload == nil || deps.Stores == nil {
-		return invalidResult(t)
-	}
-	cs, err := deps.Stores.ChannelStore(t.Fence.ChannelKey, payload.ChannelID)
-	if err != nil {
-		return Result{Kind: t.Kind, Fence: t.Fence, Err: err}
-	}
-	if cs == nil {
-		return invalidResult(t)
-	}
-	read, err := cs.ReadCommitted(ctx, store.ReadCommittedRequest{FromSeq: payload.FromSeq, MaxSeq: payload.MaxSeq, Limit: payload.Limit, MaxBytes: payload.MaxBytes})
-	return Result{Kind: t.Kind, Fence: t.Fence, Err: err, StoreReadCommitted: &StoreReadCommittedResult{Messages: read.Messages, NextSeq: read.NextSeq}}
-}
-
 func runStoreReadLog(ctx context.Context, deps Deps, t Task) Result {
 	payload := t.StoreReadLog
 	if payload == nil || deps.Stores == nil {
@@ -234,6 +232,22 @@ func runStoreApply(ctx context.Context, deps Deps, t Task) Result {
 	return Result{Kind: t.Kind, Fence: t.Fence, Err: err, StoreApply: &StoreApplyResult{LEO: applied.LEO}}
 }
 
+func runStoreCheckpoint(ctx context.Context, deps Deps, t Task) Result {
+	payload := t.StoreCheckpoint
+	if payload == nil || deps.Stores == nil {
+		return invalidResult(t)
+	}
+	cs, err := deps.Stores.ChannelStore(t.Fence.ChannelKey, payload.ChannelID)
+	if err != nil {
+		return Result{Kind: t.Kind, Fence: t.Fence, Err: err}
+	}
+	if cs == nil {
+		return invalidResult(t)
+	}
+	err = cs.StoreCheckpoint(ctx, payload.Checkpoint)
+	return Result{Kind: t.Kind, Fence: t.Fence, Err: err, StoreCheckpoint: &StoreCheckpointResult{}}
+}
+
 func runRPCPull(ctx context.Context, deps Deps, t Task) Result {
 	payload := t.RPCPull
 	if payload == nil || deps.Transport == nil {
@@ -259,6 +273,15 @@ func runRPCNotify(ctx context.Context, deps Deps, t Task) Result {
 	}
 	err := deps.Transport.Notify(ctx, payload.Node, payload.Request)
 	return Result{Kind: t.Kind, Fence: t.Fence, Err: err, RPCNotify: &RPCNotifyResult{}}
+}
+
+func runRPCPullHint(ctx context.Context, deps Deps, t Task) Result {
+	payload := t.RPCPullHint
+	if payload == nil || deps.Transport == nil {
+		return invalidResult(t)
+	}
+	err := deps.Transport.PullHint(ctx, payload.Node, payload.Request)
+	return Result{Kind: t.Kind, Fence: t.Fence, Err: err, RPCPullHint: &RPCPullHintResult{}}
 }
 
 func invalidResult(t Task) Result {

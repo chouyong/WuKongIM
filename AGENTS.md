@@ -22,7 +22,7 @@
 - 集成测试：`go test -tags=integration ./...` (不要随便跑 时间很长 开发一般跑单元测试即可)
 - 运行主程序：`go run ./cmd/wukongim`
 - 显式指定配置文件：`go run ./cmd/wukongim -config ./wukongim.conf`
-- 定向测试：`go test ./internal/... ./pkg/...`
+- 定向测试：`go test ./internal/... ./internalv2/... ./pkg/...`
 
 ## 本地部署记录
 
@@ -54,6 +54,7 @@
 
 - 单元测试不要太耗时，如果模拟真实耗时测试做成集成测试 集成测试通过`go test -tags=integration`运行
 - 关键方法和主要结构体的属性需要增加英文注释
+- 架构设计时不要过度设计
 
 ## 配置约定
 
@@ -73,6 +74,7 @@
 cmd/
   wukongim/              程序入口，负责读取配置并启动应用
   wkbench/               wkbench 黑盒 benchmark CLI，提供 validate/doctor/run/worker/dev-sim/report 入口
+  wkdb/                  节点本地只读存储排查 CLI，提供 query/repl 入口
 
 internal/
   bench/                 wkbench 黑盒客户端配置、模型、规划与协调预检
@@ -90,15 +92,6 @@ internal/
     gateway/             网关 frame -> usecase 的适配
     manager/             后台管理 HTTP API 入口、JWT 与权限适配
     node/                节点间 RPC / 转发入口适配
-  gateway/               通用网关基础设施
-    binding/             内置 handler 绑定与注册
-    core/                网关核心 server/dispatcher/registry
-    protocol/            协议适配层（wkproto / jsonrpc）
-    session/             网关会话模型与管理
-    testkit/             网关测试桩与辅助工具
-    transport/           gnet 等底层传输实现
-    types/               网关通用类型与选项
-    wkprotoenc/          WKProto 加解密辅助
   log/                   应用日志配置与 zap/lumberjack 封装
   observability/         节点内可观测性辅助
     diagnostics/         节点内有界诊断事件、采样、索引与查询
@@ -125,18 +118,37 @@ internal/
     sequence/            序列号分配
     userlimit/           节点内用户发送令牌桶限流
 
+internalv2/
+  app/                   新架构组合根；负责 clusterv2、message usecase、gateway handler/runtime 装配与生命周期
+  access/                新架构入口适配层
+    gateway/             gateway SendPacket/SendBatch -> message usecase，Sendack 写回与协议错误映射
+  contracts/             新架构跨用例/运行时轻量事件合约
+    messageevents/       消息提交事件合约
+  usecase/               新架构入口无关业务用例
+    message/             SEND/SendBatch 编排、消息 ID 分配、append port 与 committed event 提交
+  infra/                 新架构外部运行时适配器
+    cluster/             clusterv2/channelv2 append 适配与 typed error 映射
+
 pkg/
+  gateway/               通用客户端网关基础设施，提供 listener、transport、protocol、session、auth、dispatch、testkit
+  db/                    节点本地统一存储库；message/meta 共享 engine/key/row/schema/commit/cache 基础设施
+    internal/            Pebble engine、key/row codec、schema、commit coordinator、轻量 cache 等内部原语
+    message/             Channel 消息日志、索引、checkpoint、epoch history、snapshot、retention、兼容 ChannelStore API
+    meta/                Hash-slot 元数据表、批处理、快照、channel runtime meta、conversation、plugin、migration 等存储
   cluster/               集群运行时
+  clusterv2/             新版集群组合根：control/routing/net/slots/propose/channels/observe 分层，集成 controllerv2、slot/multiraft、channelv2
   channel/               Channel 维度复制、日志与节点间数据面
-    isr/                 单 channel replica group 的 ISR 运行时
-    log/                 Channel 消息日志、提交与元数据适配
-    node/                Channel 节点侧服务与批处理编排
+    handler/             append/fetch/query 入口逻辑与兼容 DurableMessage 编解码
+    replica/             单 channel ISR 副本状态机、reconcile、checkpoint、retention 与 promotion 评估
+    runtime/             channel runtime 生命周期、复制调度、backpressure 与 tombstone 管理
     transport/           Channel 数据面 RPC transport 适配
   channelv2/             实验性多 Reactor channel log runtime，用于 v0 append/fetch/replication 验证
   controller/            控制面元数据、规划器与控制器 Raft 服务
     meta/                控制面元数据存储
     plane/               控制面 planner / reconcile 编排
     raft/                控制器单组 Raft 服务
+  controllerv2/          并行新版控制面：Raft apply 维护最终 cluster-state.json，含 state/statefile/command/fsm/planner/sync/raft/server
+    docs/                controllerv2 库用法文档
   observability/         可被 pkg 与 internal 复用的可观测性轻量合约
     sendtrace/           消息发送链路 trace 事件与全局窄 sink
   protocol/              协议对象与编解码
@@ -146,7 +158,6 @@ pkg/
   raftlog/               Raft 日志持久化实现（存储controller和slot的分布式日志 但是不存储channel层的）
   slot/                  槽位级多副本运行时与分布式元数据
     fsm/                 槽位状态机与命令编解码
-    meta/                槽位业务元数据存储
     multiraft/           Multi-Raft 基础库
     proxy/               基于 cluster 的分布式存储 / RPC facade
   transport/             节点间 transport / RPC 抽象与实现
@@ -192,13 +203,18 @@ learn_project/           调研/实验代码，非主执行路径
 - `internal/usecase/*` 承载业务编排，输入输出应尽量入口无关。
 - `internal/runtime/*` 放节点内可复用运行时能力，不放入口逻辑。
 - `internal/app/*` 是唯一组合根；依赖装配只放这里。
-- `internal/gateway/*` 放网关通用基础设施，不放面向具体业务的用例编排。
+- `internalv2/access/*` 只做新架构入口协议适配，不承载通用业务规则。
+- `internalv2/usecase/*` 承载新架构入口无关业务编排，不能依赖 gateway/frame/cluster 具体实现。
+- `internalv2/infra/*` 只做新架构到 pkg 运行时或外部基础设施的适配。
+- `internalv2/app/*` 是 internalv2 唯一组合根；依赖装配只放这里。
+- `pkg/gateway/*` 放可复用网关通用基础设施，不放面向具体业务的用例编排。
 
 ## 变更规则
 
 - 新增 HTTP、RPC、任务入口时，优先落到 `internal/access/<entry>`。
 - 新增可复用业务能力时，优先落到 `internal/usecase/<domain>`。
 - 新增本地状态、在线路由、分配器等能力时，优先落到 `internal/runtime/<capability>`。
+- 新增 internalv2 能力时，保持 `access -> usecase -> ports/contracts`，由 `infra` 实现具体 pkg 运行时适配。
 - 不再引入新的“大而全 service 包”或新的全局聚合服务对象。
 
 ## 提交前检查

@@ -1,52 +1,135 @@
 # pkg/channelv2 Flow
 
-## Purpose
-
-`pkg/channelv2` is an experimental multiple-reactor channel log runtime. Phase 2 validates append, fetch, follower replication, ACK, HW commit behavior, and benchmark-visible metrics through multiple reactors plus typed bounded worker pools without replacing `pkg/channel`.
-
-## Package Boundaries
-
-- Root package defines public DTOs, errors, and the `Cluster` interface.
-- `service/` is the synchronous facade. It validates requests, routes them to reactors, and waits on futures.
-- `reactor/` owns channel-key routing, priority mailboxes, and per-channel state ownership.
-- `machine/` owns pure channel state transitions and never performs blocking I/O.
-- `store/` exposes the narrow persistence contract plus memory and old-store adapters.
-- `transport/` exposes the v0 pull/ack replication protocol.
-- `testkit/` provides a memory multi-node cluster harness.
-
-## ApplyMeta
-
-`ApplyMeta` applies the authoritative channel runtime view. It creates local channel state if needed, loads store state, applies leader/follower role, and seeds leader progress from local LEO. It remains the explicit metadata push/refresh path, but Append no longer requires callers to invoke it first when the service is configured with a metadata resolver. It does not elect leaders or repair metadata.
-
-## Append
-
-`Append` and `AppendBatch` route to the owning reactor. Before submitting the append event, the service verifies that the reactor already owns channel state. If not, and a `MetaResolver` is configured, the service resolves authoritative metadata, applies it through the normal `ApplyMeta` path to create and seed the reactor state, then submits the append. Without a resolver, an unloaded channel keeps the existing `ErrChannelNotFound` behavior. The reactor admits leader-ready requests into a bounded per-channel append queue, batches them by record count, bytes, or max wait, and proposes one machine append batch with a reactor-owned fence op id. Store appends run on the bounded store-append worker pool; fenced completions return as high-priority worker results, are applied back in the reactor, and may complete multiple client waiters when local or quorum commit criteria are met. Observer hooks record submitted batch records/bytes/wait and append completion latency for accepted requests, and the async append benchmarks report batch and allocation metrics. Worker-pool backpressure rolls the proposed batch back to the queue and retries on a later tick after the append retry backoff, leaving accepted client futures pending. Caller cancellation after admission is cooperative: the owning reactor tracks cancellable append contexts and sweeps them on event turns and flush attempts. A canceled append is removed from the queue, inflight waiter state, or post-store quorum waiter state, and its future completes with the context error. Already-started durable store writes are allowed to finish; their later completions use the original batch record counts and do not complete canceled client waiters as success.
-
-## Fetch
-
-`Fetch` captures the current HW and submits a `StoreReadCommitted` worker task to the bounded store-read worker pool. The reactor keeps only a fenced waiter, so high-priority metadata changes can proceed while storage is blocked. Worker result observer hooks record the read completion kind, error, and worker duration when the group routes the result. A metadata fence change fails pending fetch waiters with `ErrStaleMeta`, and stale worker completions are ignored without leaking the waiter. Reactor/group close fails pending fetch waiters with `ErrClosed` and cancels store-read worker contexts. Fetch never returns records above HW.
-
-## Replication
-
-Replication is owned by each channel's reactor runtime. `service.Tick` only calls `group.Tick(ctx)`, which submits low-priority tick events; the reactor decides whether an active local follower should pull, apply, or ack. Follower pull offsets are based on local `LEO + 1`, not committed HW or a service-side fetch. RPC pull, store apply, and ACK completions flow through worker result observer hooks, while three-node async benchmarks exercise the worker-pool path with local transport. Leader append completion also sends a best-effort notify RPC to non-local replicas. Notify carries no records or commit state; it only marks the follower dirty so the follower-owned reactor can submit an immediate pull. Short-poll idle retry remains the fallback when notify is dropped, backpressured, or races metadata changes.
+## Directory Tree
 
 ```text
-leader append stored -> TaskRPCNotify(followers)
-follower EventNotify/Tick -> TaskRPCPull(leader, LEO+1)
-leader EventPull -> TaskStoreReadLog -> PullResponse(records, leaderHW, leaderLEO)
-follower TaskStoreApply -> local LEO/HW
-follower TaskRPCAck(matchOffset)
-leader EventAck -> AdvanceHW -> complete quorum waiters
+pkg/channelv2/        - Experimental multi-reactor channel log runtime; root DTOs, errors, Cluster facade, Config, tests, and benchmarks.
+|-- machine/          - Pure per-channel state transitions for metadata, append, progress, and invariants; no blocking I/O.
+|-- reactor/          - Channel-key ownership, priority mailboxes, append queues, scheduler, lifecycle, metrics, and worker-result application.
+|-- replication/      - Leader/follower replication helpers and protocol decisions used by reactor runtime paths.
+|-- service/          - Synchronous facade that validates requests, requires preloaded append state, lazily activates PullHint followers, routes work to reactors, and waits on futures.
+|-- store/            - Narrow persistence contract, memory store, and `pkg/db/message` compatibility adapter boundary.
+|-- testkit/          - In-memory multi-node cluster harness for channelv2 tests.
+|-- transport/        - V0 local/RPC transport DTOs for pull, ack, notify compatibility, and PullHint.
+`-- worker/           - Typed bounded worker pools for store append/read/apply, RPC pull/ack/PullHint, checkpoint, and result delivery.
 ```
 
-A follower keeps at most one pull RPC in flight, exactly one pending pull response waiting for store apply, and one ACK RPC in flight. Pull, apply, and ACK completions are fenced by generation, epoch, leader epoch, and op id; stale completions are ignored before they clear or advance runtime state. Apply errors and store-apply backpressure retain the pending pull response for retry. Pending ACKs are retried before new pulls, and ACK errors or ACK backpressure retain the exact stored match offset for retry. Leader pull handling is asynchronous through the store-read worker pool so blocked log reads do not block high-priority metadata events.
-Metadata fence changes reset follower pull/apply/ACK inflight and pending state before active followers are marked dirty under the new epoch. Leader-side pull waiters complete with `ErrStaleMeta` on metadata fence changes, the caller context error on cancellation, or `ErrClosed` on close; late store completions are ignored after the waiter is removed. Leader ACK handling ignores stale or regressive matches, so they do not advance HW or complete quorum waiters.
+`store/channel_adapter.go` is the only channelv2 file that may import `pkg/channel` DTOs required by the `pkg/db/message` engine; other channelv2 packages should depend on channelv2 interfaces.
 
-## Backpressure
+Diagram labels use `event or guard / effect` so agents can distinguish triggers from side effects.
 
-Mailboxes, append queues, and worker pools are bounded, and observer hooks sample reactor mailbox depths and worker queue depths after cheap submit/drain points. Normal request admission returns `ErrBackpressured` when full. Append queue limits reject new requests before they become waiters; store append worker-pool backpressure keeps already accepted requests pending for retry. Fetch and leader pull log reads use the store-read worker pool, with fetch fail-fast behavior when that pool rejects the task. Follower pull, apply, ACK, and notify use typed bounded worker tasks; store-apply backpressure keeps the single pending pull response for retry, and ACK backpressure keeps the exact match offset for retry rather than issuing duplicate pulls or advancing the offset. Notify failures are observed but do not fail accepted appends because follower short-poll can still catch up.
-Low-priority tick mailbox events are droppable/coalesced; if a direct tick submit carries a future and is dropped, the future is completed immediately so callers do not hang. Benchmarks report allocation counts and selected observer-derived batch/queue metrics but do not assert absolute throughput.
+## Append Sequence
 
-## Import Boundary
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Service as service facade
+    participant Reactor as owning reactor
+    participant Workers as typed worker pools
+    participant Follower as follower reactor
 
-Only `store/channel_adapter.go` imports old `pkg/channel` or `pkg/channel/store`. Other channelv2 packages must depend only on channelv2 interfaces.
+    Caller->>Service: Append / AppendBatch
+    Service->>Reactor: ReserveAppend(key) and HasChannelState(key)
+    alt channel runtime not loaded
+        Service-->>Caller: ErrChannelNotFound
+    end
+    Service->>Reactor: submit append event
+    Reactor->>Reactor: validate leader, epoch, capacity
+    alt not leader, stale meta, or queue full
+        Reactor-->>Service: complete future with typed error
+        Service-->>Caller: error
+    else accepted
+        Reactor->>Reactor: enqueue per-channel append queue
+        Reactor->>Reactor: flush by max records, bytes, or wait
+        Reactor->>Workers: TaskStoreAppend(batch, fence)
+        Workers-->>Reactor: append result
+        Reactor->>Reactor: apply fenced result and update local progress
+
+        alt CommitModeLocal
+            Reactor-->>Service: complete future after local durable append
+            Service-->>Caller: AppendResult / AppendBatchResult
+        else CommitModeQuorum
+            Reactor->>Workers: TaskRPCPullHint(lagging followers)
+            Workers-->>Follower: PullHint
+            loop until leader HW covers appended records
+                Follower->>Workers: TaskRPCPull(leader, local LEO + 1)
+                Workers->>Reactor: EventPull
+                alt requested offsets covered by leader recent-record cache
+                    Reactor-->>Follower: PullResponse(records, leader HW, leader LEO)
+                else cache miss or older prefix needed
+                    Reactor->>Workers: TaskStoreReadLog
+                    Workers-->>Reactor: store prefix records
+                    Reactor-->>Follower: PullResponse(store prefix + optional cache suffix, leader HW, leader LEO)
+                end
+                Follower->>Workers: TaskStoreApply(records)
+                Workers-->>Follower: apply result
+                Follower->>Workers: TaskRPCAck(match offset)
+                Workers->>Reactor: EventAck
+                Reactor->>Reactor: AdvanceHW
+            end
+            Reactor-->>Service: complete quorum future
+            Service-->>Caller: AppendResult / AppendBatchResult
+        end
+    end
+```
+
+Leader reactors keep a small configurable recent-record suffix cache for durable append records. Follower `Pull` requests that are covered by this suffix can complete from memory; older requests still use `TaskStoreReadLog`, and the leader may append a cache-covered suffix to the store prefix when doing so does not create gaps. The cache is cleared by metadata fences or role changes and is only a performance optimization.
+
+## Channel Runtime Lifecycle Model
+
+`Unloaded` is represented by absence from the owning reactor's `channels` map.
+Loaded runtimes hold `machine.ChannelState`, `appendQueue`, `replicationState`,
+leader-visible follower state, and an explicit `runtimeLifecycle` phase model.
+Metadata reload is not a long-lived phase: accepted metadata fence changes fail
+stale waiters, reset transient lifecycle/replication state, apply the new
+`Meta`, and then choose the leader or follower runtime path from local role.
+
+Leader phases:
+
+- `Serving`: normal hot or idle leader runtime. Idle slowdown is derived from
+  idle age and `leaderPullDelay`; it is not stored as a lifecycle phase.
+- `StoppingFollowers`: the leader is idle-expired and waits for caught-up
+  followers to pull at `LEO+1` so it can return `PullControlStop`.
+- `Checkpointing`: all followers stopped for the current activity version and
+  the leader checkpoint is in flight or retrying.
+- `FinalRecheck`: the checkpoint finished and a normal-priority recheck fences
+  leader eviction behind same-channel append reservations and submit sequence
+  changes.
+
+Follower phases:
+
+- `Replicating`: ordinary pull, apply, ACK, park, and retry behavior.
+- `StopCheckpointing`: the follower accepted `PullControlStop` after local
+  LEO/HW caught up and is checkpointing before the stopped ACK.
+- `StopAcking`: the checkpoint succeeded and the follower is sending or
+  retrying the stopped ACK before unloading runtime state.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unloaded
+    Unloaded --> Loaded: ApplyMeta or PullHint lazy activation / load store state
+    Loaded --> LeaderServing: local role = leader
+    Loaded --> FollowerReplicating: local role = follower
+
+    LeaderServing --> LeaderStoppingFollowers: idle expired && HW == LEO && followers caught up
+    LeaderStoppingFollowers --> LeaderServing: append or metadata fence
+    LeaderStoppingFollowers --> LeaderCheckpointing: all followers stopped at ActivityVersion
+    LeaderCheckpointing --> LeaderServing: append or metadata fence
+    LeaderCheckpointing --> LeaderFinalRecheck: checkpoint done and guards still pass
+    LeaderFinalRecheck --> LeaderServing: append reservation or submit sequence change
+    LeaderFinalRecheck --> Unloaded: no pending work / evict runtime
+
+    FollowerReplicating --> FollowerStopCheckpointing: PullControlStop && local LEO/HW caught up
+    FollowerStopCheckpointing --> FollowerReplicating: newer PullHint or metadata fence
+    FollowerStopCheckpointing --> FollowerStopAcking: checkpoint done
+    FollowerStopAcking --> FollowerReplicating: stale stopped ACK metadata
+    FollowerStopAcking --> Unloaded: stopped ACK succeeds / evict runtime
+
+    LeaderServing --> Unloaded: Close
+    FollowerReplicating --> Unloaded: Close
+```
+
+Lifecycle decisions are expressed as reactor-owned actions such as starting a
+checkpoint, scheduling lifecycle retry, queuing leader final recheck, sending a
+stopped ACK, or evicting runtime. Store and transport I/O still run through the
+existing worker pools; the lifecycle model only decides what should happen next.

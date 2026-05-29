@@ -28,25 +28,6 @@ func (r *Reactor) submitStoreAppend(ctx context.Context, channelID ch.ChannelID,
 	})
 }
 
-func (r *Reactor) submitStoreReadCommitted(ctx context.Context, channelID ch.ChannelID, task machine.Task) error {
-	if task.ReadCommitted == nil || r.cfg.Pools == nil {
-		return ch.ErrInvalidConfig
-	}
-	read := task.ReadCommitted
-	return r.cfg.Pools.Submit(ctx, worker.Task{
-		Kind:    worker.TaskStoreReadCommitted,
-		Fence:   task.Fence,
-		Context: ctx,
-		StoreReadCommitted: &worker.StoreReadCommittedTask{
-			ChannelID: channelID,
-			FromSeq:   read.FromSeq,
-			MaxSeq:    read.MaxSeq,
-			Limit:     read.Limit,
-			MaxBytes:  read.MaxBytes,
-		},
-	})
-}
-
 func (r *Reactor) submitStoreReadLog(ctx context.Context, channelID ch.ChannelID, fence ch.Fence, fromOffset uint64, maxOffset uint64, maxBytes int) error {
 	if r.cfg.Pools == nil {
 		return ch.ErrInvalidConfig
@@ -80,6 +61,21 @@ func (r *Reactor) submitStoreApply(ctx context.Context, channelID ch.ChannelID, 
 	})
 }
 
+func (r *Reactor) submitStoreCheckpoint(ctx context.Context, channelID ch.ChannelID, fence ch.Fence, checkpoint ch.Checkpoint) error {
+	if r.cfg.Pools == nil {
+		return ch.ErrInvalidConfig
+	}
+	return r.cfg.Pools.Submit(ctx, worker.Task{
+		Kind:    worker.TaskStoreCheckpoint,
+		Fence:   fence,
+		Context: ctx,
+		StoreCheckpoint: &worker.StoreCheckpointTask{
+			ChannelID:  channelID,
+			Checkpoint: checkpoint,
+		},
+	})
+}
+
 func (r *Reactor) submitRPCPull(ctx context.Context, leader ch.NodeID, fence ch.Fence, req transport.PullRequest) error {
 	if r.cfg.Pools == nil {
 		return ch.ErrInvalidConfig
@@ -104,15 +100,18 @@ func (r *Reactor) submitRPCAck(ctx context.Context, leader ch.NodeID, fence ch.F
 	})
 }
 
-func (r *Reactor) submitRPCNotify(ctx context.Context, node ch.NodeID, fence ch.Fence, req transport.NotifyRequest) error {
+func (r *Reactor) submitPullHint(ctx context.Context, node ch.NodeID, fence ch.Fence, req transport.PullHintRequest) error {
 	if r.cfg.Pools == nil {
 		return ch.ErrInvalidConfig
 	}
 	return r.cfg.Pools.Submit(ctx, worker.Task{
-		Kind:      worker.TaskRPCNotify,
-		Fence:     fence,
-		Context:   ctx,
-		RPCNotify: &worker.RPCNotifyTask{Node: node, Request: req},
+		Kind:    worker.TaskRPCPullHint,
+		Fence:   fence,
+		Context: ctx,
+		RPCPullHint: &worker.RPCPullHintTask{
+			Node:    node,
+			Request: req,
+		},
 	})
 }
 
@@ -123,11 +122,9 @@ func (r *Reactor) completeReplies(rc *runtimeChannel, replies []machine.Reply, i
 		case machine.ReplyKindAppend:
 			future := immediate
 			if future == nil && rc != nil {
-				if _, ok := rc.fetchWaiters[reply.OpID]; !ok {
-					future = rc.waiters[reply.OpID]
-					delete(rc.waiters, reply.OpID)
-					r.unregisterAppendCancelContext(rc, reply.OpID)
-				}
+				future = rc.waiters[reply.OpID]
+				delete(rc.waiters, reply.OpID)
+				r.unregisterAppendCancelContext(rc, reply.OpID)
 			}
 			if future != nil {
 				batch := ch.AppendBatchResult{Items: reply.AppendItems}
@@ -136,20 +133,6 @@ func (r *Reactor) completeReplies(rc *runtimeChannel, replies []machine.Reply, i
 				}
 				r.observeAppendComplete(rc, reply.OpID)
 				future.Complete(Result{AppendBatch: batch, Err: reply.Err})
-				completed = true
-			}
-		case machine.ReplyKindFetch:
-			future := immediate
-			if future == nil && rc != nil {
-				if _, ok := rc.fetchWaiters[reply.OpID]; ok {
-					waiter := rc.waiters[reply.OpID]
-					future = waiter
-					delete(rc.waiters, reply.OpID)
-					delete(rc.fetchWaiters, reply.OpID)
-				}
-			}
-			if future != nil {
-				future.Complete(Result{Fetch: reply.Fetch, Err: reply.Err})
 				completed = true
 			}
 		}
@@ -172,20 +155,6 @@ func (rc *runtimeChannel) addWaiter(opID ch.OpID, future *Future) error {
 		return ch.ErrInvalidConfig
 	}
 	rc.waiters[opID] = future
-	return nil
-}
-
-func (rc *runtimeChannel) addFetchWaiter(opID ch.OpID, future *Future) error {
-	if err := rc.addWaiter(opID, future); err != nil {
-		return err
-	}
-	if rc == nil || future == nil {
-		return nil
-	}
-	if rc.fetchWaiters == nil {
-		rc.fetchWaiters = make(map[ch.OpID]struct{})
-	}
-	rc.fetchWaiters[opID] = struct{}{}
 	return nil
 }
 
@@ -256,48 +225,12 @@ func (r *Reactor) clearPullCancelChannel(rc *runtimeChannel) {
 	delete(r.pullCancelChannels, rc.state.Key)
 }
 
-func (rc *runtimeChannel) removeFetchWaiter(opID ch.OpID) *Future {
-	if rc == nil {
-		return nil
-	}
-	future := rc.waiters[opID]
-	delete(rc.waiters, opID)
-	delete(rc.fetchWaiters, opID)
-	return future
-}
-
-func (rc *runtimeChannel) completeStaleFetchIfWaiting(opID ch.OpID) {
-	if rc == nil {
-		return
-	}
-	if _, ok := rc.fetchWaiters[opID]; !ok {
-		return
-	}
-	future := rc.removeFetchWaiter(opID)
-	future.Complete(Result{Err: ch.ErrStaleMeta})
-}
-
-func (rc *runtimeChannel) failPendingFetchWaiters(err error) {
-	if rc == nil || len(rc.fetchWaiters) == 0 {
-		return
-	}
-	for opID := range rc.fetchWaiters {
-		future := rc.removeFetchWaiter(opID)
-		if future != nil {
-			future.Complete(Result{Err: err})
-		}
-	}
-}
-
 // failPendingAppendWaiters completes append waiters that are fenced by accepted metadata.
 func (r *Reactor) failPendingAppendWaiters(rc *runtimeChannel, err error) {
 	if r == nil || rc == nil {
 		return
 	}
 	for opID, future := range rc.waiters {
-		if _, ok := rc.fetchWaiters[opID]; ok {
-			continue
-		}
 		delete(rc.waiters, opID)
 		r.unregisterAppendCancelContext(rc, opID)
 		r.completeAppendFuture(rc, opID, future, Result{Err: err})
@@ -318,20 +251,36 @@ func (r *Reactor) failWaiters(rc *runtimeChannel, err error) {
 	for opID, future := range rc.waiters {
 		delete(rc.waiters, opID)
 		if future != nil {
-			if _, ok := rc.fetchWaiters[opID]; ok {
-				future.Complete(Result{Err: err})
-			} else {
-				r.unregisterAppendCancelContext(rc, opID)
-				r.completeAppendFuture(rc, opID, future, Result{Err: err})
-			}
+			r.unregisterAppendCancelContext(rc, opID)
+			r.completeAppendFuture(rc, opID, future, Result{Err: err})
 		}
-	}
-	for opID := range rc.fetchWaiters {
-		delete(rc.fetchWaiters, opID)
 	}
 	rc.appendQ.clear()
 	rc.appendInflight = nil
 	rc.failPendingPullWaiters(err)
+}
+
+func (r *Reactor) evictRuntimeChannel(key ch.ChannelKey, rc *runtimeChannel, reason string) bool {
+	_ = reason
+	if r == nil || rc == nil || rc.state == nil || r.channels[key] != rc {
+		return false
+	}
+	if !rc.safeToEvictRuntime() {
+		return false
+	}
+	role := rc.state.Role
+	r.clearAppendCancelContexts(rc)
+	r.clearPullCancelChannel(rc)
+	if err := rc.store.Close(); err != nil {
+		return false
+	}
+	delete(r.channels, key)
+	r.observeChannelRuntimeEvicted(key, role)
+	return true
+}
+
+func (rc *runtimeChannel) safeToEvictRuntime() bool {
+	return runtimeViewFromChannel(rc, time.Now(), AppendFenceView{}).SafeToEvict()
 }
 
 func (rc *runtimeChannel) failPendingPullWaiters(err error) {
@@ -454,6 +403,32 @@ func defaultReactorConfig(cfg ReactorConfig) ReactorConfig {
 	if cfg.PullMaxBytes <= 0 {
 		cfg.PullMaxBytes = 64 * 1024
 	}
+	if cfg.LeaderRecentRecordCacheSize == 0 {
+		cfg.LeaderRecentRecordCacheSize = 10
+	}
+	if cfg.LeaderRecentRecordCacheSize < 0 {
+		cfg.LeaderRecentRecordCacheBytes = 0
+	} else if cfg.LeaderRecentRecordCacheBytes <= 0 {
+		cfg.LeaderRecentRecordCacheBytes = min(cfg.PullMaxBytes, 256*1024)
+	}
+	if cfg.IdleSlowdownAfter <= 0 {
+		cfg.IdleSlowdownAfter = 30 * time.Second
+	}
+	if cfg.IdleEvictAfter <= 0 {
+		cfg.IdleEvictAfter = 5 * time.Minute
+	}
+	if cfg.IdlePullMinInterval <= 0 {
+		cfg.IdlePullMinInterval = cfg.ReplicationIdlePollInterval
+	}
+	if cfg.IdlePullMaxInterval <= 0 {
+		cfg.IdlePullMaxInterval = 5 * time.Second
+	}
+	if cfg.IdleEvictCheckInterval <= 0 {
+		cfg.IdleEvictCheckInterval = time.Second
+	}
+	if cfg.PullHintRetryInterval <= 0 {
+		cfg.PullHintRetryInterval = time.Second
+	}
 	cfg.Observer = defaultObserver(cfg.Observer)
 	return cfg
 }
@@ -465,16 +440,11 @@ func (r *Reactor) nextBatchOpID() ch.OpID {
 	return ch.OpID(1<<63 + r.nextOp.Add(1))
 }
 
-func (r *Reactor) flushDueAppends(now time.Time) {
-	for _, rc := range r.channels {
-		r.tryFlushAppend(rc, now)
-	}
-}
-
 func (r *Reactor) tryFlushAppend(rc *runtimeChannel, now time.Time) {
 	if r == nil || rc == nil {
 		return
 	}
+	defer r.scheduleAppendFlushFromState(rc)
 	r.sweepAppendCancellationsForChannel(rc)
 	if rc.appendInflight != nil {
 		return
@@ -578,9 +548,6 @@ func (r *Reactor) cancelAppendWaiter(rc *runtimeChannel, opID ch.OpID, cancelErr
 		}
 		r.completeAppendFuture(rc, opID, future, Result{Err: cancelErr})
 		return true
-	}
-	if _, isFetch := rc.fetchWaiters[opID]; isFetch {
-		return false
 	}
 	future := rc.waiters[opID]
 	if future != nil {

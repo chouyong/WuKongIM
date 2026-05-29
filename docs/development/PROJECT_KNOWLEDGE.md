@@ -1,5 +1,11 @@
 # Project Knowledge
 
+## Internalv2
+
+- `internalv2` phase 1 is a parallel send-to-sendack skeleton: gateway SEND maps to `usecase/message.SendBatch`, appends through `infra/cluster.ChannelAppender`, and returns SENDACK after `pkg/clusterv2` / `pkg/channelv2` append.
+- `internalv2` single-node deployments must use single-node cluster config. Do not add send or storage paths that bypass clusterv2 semantics.
+- `internalv2/app` seeds message IDs from the effective clusterv2 node ID: `Config.Cluster.NodeID` when set, otherwise top-level `Config.NodeID`.
+
 ## Channel Runtime
 
 ### Conversation working set
@@ -90,6 +96,7 @@
 - SEND batching is layered: gateway shards by raw `ChannelID + ChannelType` only to preserve entry ordering and collect micro-batches; message usecase groups adjacent canonical same-channel sends; `pkg/channel.AppendBatch` performs one replica append with contiguous seqs.
 - Remote channel append forwarding supports one-channel batch RPC; falling back to per-message forwarding loses the durable/follower batching benefit for clients connected to non-leader nodes.
 - Single SEND/Append entrypoints are compatibility wrappers; durable send and app channel append internals should route through batch-of-one to avoid split correctness/performance paths.
+- `pkg/channelv2` append is local-runtime only: clusterv2 must ensure/apply authoritative ChannelMeta first and forward non-leader appends to the resolved channel leader.
 
 ## Cluster Membership
 
@@ -128,6 +135,11 @@
 - Slot Raft snapshot restore follows the same boundary as Controller Raft: restore snapshot data first, then replay committed entries after the snapshot index.
 - After Slot Raft log compaction exists, membership changes must refresh the snapshot ConfState so newly added learners can install a snapshot and catch up.
 - Large Slot Raft snapshots are chunked only in `pkg/cluster` raft transport; receivers reassemble chunks into the original `MsgSnap` before calling `multiraft.Runtime.Step`.
+
+### Local storage
+- `pkg/db` is the single local storage library: `message` owns channel logs and `meta` owns hash-slot metadata.
+- Ordinary new `pkg/db/meta` tables should use the meta table runtime registry; custom code is reserved for cache, guard, monotonic, or multi-record state-machine semantics.
+- A single-node deployment is still a single-node cluster; do not add storage or business paths that bypass cluster semantics.
 
 ### Node scale-in
 - Manager-driven node scale-in drains a node to `ready_to_remove`; it must not call physical Slot removal or Kubernetes scale-down directly.

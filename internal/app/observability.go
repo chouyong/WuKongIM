@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	accessgateway "github.com/WuKongIM/WuKongIM/internal/gateway"
 	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
 	controllermeta "github.com/WuKongIM/WuKongIM/pkg/controller/meta"
+	accessgateway "github.com/WuKongIM/WuKongIM/pkg/gateway"
 	obsmetrics "github.com/WuKongIM/WuKongIM/pkg/metrics"
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
 	"github.com/WuKongIM/WuKongIM/pkg/transport"
@@ -925,6 +925,8 @@ func slotLeaderSkew(nodes []controllermeta.ClusterNode, views []controllermeta.S
 
 func transportMsgType(msgType uint8) string {
 	switch msgType {
+	case transport.MsgTypeRPCNotify:
+		return "rpc_notify"
 	case transport.MsgTypeRPCRequest:
 		return "rpc_request"
 	case transport.MsgTypeRPCResponse:

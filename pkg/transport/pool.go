@@ -71,7 +71,17 @@ func NewPool(args ...any) *Pool {
 }
 
 func (p *Pool) Send(nodeID NodeID, shardKey uint64, msgType uint8, body []byte) error {
-	mc, err := p.acquire(context.Background(), nodeID, shardKey)
+	return p.SendWithContext(context.Background(), nodeID, shardKey, msgType, body)
+}
+
+// SendWithContext enqueues a one-way message and bounds connection acquisition with ctx.
+func (p *Pool) SendWithContext(ctx context.Context, nodeID NodeID, shardKey uint64, msgType uint8, body []byte) error {
+	// gofail: var wkTransportSendFault string
+	// return errors.New(wkTransportSendFault)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	mc, err := p.acquire(ctx, nodeID, shardKey)
 	if err != nil {
 		p.observeEnqueue(nodeID, p.cfg.DefaultPri, err)
 		return err
@@ -82,6 +92,8 @@ func (p *Pool) Send(nodeID NodeID, shardKey uint64, msgType uint8, body []byte) 
 }
 
 func (p *Pool) RPC(ctx context.Context, nodeID NodeID, shardKey uint64, payload []byte) ([]byte, error) {
+	// gofail: var wkTransportRPCFault string
+	// return nil, errors.New(wkTransportRPCFault)
 	if ctx == nil {
 		ctx = context.Background()
 	}
