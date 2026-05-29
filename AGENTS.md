@@ -211,3 +211,18 @@ learn_project/           调研/实验代码，非主执行路径
 
 - 发现重要的项目规则或业务知识时，记录到：**`docs/development/PROJECT_KNOWLEDGE.md`** 记录的内容需要简单，清晰，明确 不要啰嗦，保持整个文档内容不要太多
 - 在做任务过程中发现一些与此任务无关的代码质量问题可以先记录到 **`docs/development/CODE_QUALITY.md`** 然后继续任务不要中断当前任务
+
+## WuKongIM 测试环境
+
+- 当前已验证可用的阿里云测试环境说明见：`docs/development/WUKONGIM_TEST_ENV.md`
+- 该文档记录了：
+  - 公网 IP `47.101.164.59`
+  - 内网 IP `172.16.0.9`
+  - 管理后台登录账号 `admin / qjl851668`
+  - 游客账号 `guest / guest`
+  - 如何通过 `/manager/login` 获取 token
+  - 如何用 `curl` 调用 `health`、`varz`、`/manager/system`、`/manager/nodes`、`/manager/users`
+- 注意：
+  - `managerToken` 不是管理后台网页登录密码
+  - 管理后台网页登录依赖 `auth.users`
+  - `wk.yaml` 必须写在宿主机 `./wukongimdata/wk.yaml`，且 YAML 缩进必须正确
